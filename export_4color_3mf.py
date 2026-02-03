@@ -10,6 +10,53 @@ NUM_COLORS = 4
 KMEANS_ITERATIONS = 20
 EXPORT_SCALE = 0.1  # 出力サイズを10%に
 USE_SELECTION_ONLY = True  # True: 選択されたメッシュのみ処理（1体だけ出力したい場合は1つだけ選択）
+BAKE_TO_VERTEX_COLOR = True  # True: 表示色を頂点カラーにベイクしてから減色（テクスチャ等も反映）
+BAKE_TARGET_ATTR_NAME = "Col"  # ベイク先のカラー属性名（"Col" で既存を上書き / "Color" で新規）
+
+
+def ensure_bake_target_color_attribute(mesh, name):
+    """メッシュにカラー属性がなければ追加。ドメインは FACE_CORNER（ループ）。"""
+    idx = mesh.color_attributes.find(name)
+    if idx >= 0:
+        return mesh.color_attributes[idx]
+    return mesh.color_attributes.new(name=name, type="BYTE_COLOR", domain="CORNER")
+
+
+def bake_material_to_vertex_colors(obj, target_attr_name="Col"):
+    """
+    オブジェクトのマテリアル表示色（テクスチャ含む）を頂点カラーにベイクする。
+    Cycles のベイクで target=VERTEX_COLORS を使用。ベイク先はアクティブなカラー属性。
+    """
+    scene = bpy.context.scene
+    view_layer = bpy.context.view_layer
+    mesh = obj.data
+    if not mesh.polygons:
+        return False
+    # ベイク先のカラー属性を用意（既存があればそれを使い、なければ新規）
+    attr = ensure_bake_target_color_attribute(mesh, target_attr_name)
+    mesh.color_attributes.active_color_index = mesh.color_attributes.find(attr.name)
+    # レンダーエンジンを Cycles に
+    scene.render.engine = "CYCLES"
+    if hasattr(scene, "cycles"):
+        scene.cycles.bake_type = "DIFFUSE"
+        if hasattr(scene.cycles, "bake_direct"):
+            scene.cycles.bake_direct = False
+        if hasattr(scene.cycles, "bake_indirect"):
+            scene.cycles.bake_indirect = False
+    # BakeSettings (Blender 4.x/5.x): 頂点カラーへベイク
+    bake = getattr(scene.render, "bake", None)
+    if bake is not None and hasattr(bake, "target"):
+        bake.target = "VERTEX_COLORS"
+    # 選択をこのオブジェクトだけに
+    bpy.ops.object.select_all(action="DESELECT")
+    obj.select_set(True)
+    view_layer.objects.active = obj
+    try:
+        bpy.ops.object.bake(type="DIFFUSE")
+        return True
+    except Exception as e:
+        print(f"  ベイク失敗: {e}")
+        return False
 
 
 def get_face_colors_from_mesh(obj):
@@ -260,6 +307,19 @@ def process_scene():
         return
     for i, o in enumerate(candidates):
         print(f"  - [{i}] {o.name}")
+
+    # 表示色を頂点カラーにベイク（オプション）
+    if BAKE_TO_VERTEX_COLOR and candidates:
+        scene.render.engine = "CYCLES"
+        for obj in candidates:
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            view_layer.objects.active = obj
+            print(f"  ベイク中: {obj.name} → 属性 \"{BAKE_TARGET_ATTR_NAME}\"")
+            if bake_material_to_vertex_colors(obj, BAKE_TARGET_ATTR_NAME):
+                print(f"    完了: {obj.name}")
+            else:
+                print(f"    スキップまたは失敗: {obj.name}")
 
     # 既存の「分割済み」オブジェクトを削除するかはオプション。ここでは新規作成のみ。
     created = []

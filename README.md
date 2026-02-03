@@ -53,6 +53,15 @@ Blender 5.0.1 でメッシュを **4色に減色** し、**色ごとにオブジ
 | `KMEANS_ITERATIONS` | 減色の K-means 反復回数 |
 | `EXPORT_SCALE` | 出力スケール（0.1 = 10%） |
 | `USE_SELECTION_ONLY` | True なら選択メッシュのみ処理（1体だけ出力する場合は1つだけ選択） |
+| `BAKE_TO_VERTEX_COLOR` | True なら表示色（テクスチャ含む）を頂点カラーにベイクしてから減色 |
+| `BAKE_TARGET_ATTR_NAME` | ベイク先のカラー属性名（"Col" で既存を上書き / "Color" で新規） |
+
+## 表示色を頂点カラーにベイクしてから減色（BAKE_TO_VERTEX_COLOR）
+
+- `BAKE_TO_VERTEX_COLOR = True`（デフォルト）のとき、スクリプト実行時に **マテリアルの表示色（テクスチャ・画像含む）を頂点カラーにベイク** してから 4 色減色・分割・3MF 出力します。
+- Blender 上で見えている色（テクスチャやノードの色）がそのまま減色の元になるため、手動でベイクする必要はありません。
+- ベイクには **Cycles** を使用します。レンダーエンジンが一時的に Cycles に切り替わります。
+- ベイクを無効にしたい場合は `BAKE_TO_VERTEX_COLOR = False` にしてください。
 
 ## ライセンス
 
