@@ -6,6 +6,8 @@ import bmesh
 
 # ---------- 設定 ----------
 OUTPUT_PATH = "D:/3DCG/output_4colors_quantized_only.3mf"
+# エクスポート形式: "3mf" = 3MF（Bambu等）, "obj" = 頂点色付きOBJ（Bambu等で色が取れる場合あり）
+EXPORT_FORMAT = "obj"  # "3mf" または "obj"
 NUM_COLORS = 4
 KMEANS_ITERATIONS = 20
 EXPORT_SCALE = 0.1  # 出力サイズを10%に
@@ -492,18 +494,43 @@ def process_scene():
                 o.scale *= EXPORT_SCALE
             bpy.ops.object.transform_apply(scale=True)
 
-        # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
-        try:
-            bpy.ops.export_mesh.threemf(filepath=OUTPUT_PATH)
-            print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
-        except AttributeError:
-            # アドオンが three_mf などの別名で登録している場合
+        # エクスポート形式に応じて 3MF または 頂点色付き OBJ を出力
+        if EXPORT_FORMAT == "obj":
+            # 頂点色付き OBJ（Bambu Studio 等で色が認識される場合あり）
+            obj_path = OUTPUT_PATH.rstrip()
+            if not obj_path.lower().endswith(".obj"):
+                base = obj_path.rsplit(".", 1)[0] if "." in obj_path else obj_path
+                obj_path = base + ".obj"
             try:
-                bpy.ops.export_mesh.three_mf(filepath=OUTPUT_PATH)
+                bpy.ops.wm.obj_export(filepath=obj_path, export_colors=True)
+                print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+            except TypeError:
+                # パラメータ名が export_vertex_colors 等の場合
+                try:
+                    bpy.ops.wm.obj_export(filepath=obj_path, export_vertex_colors=True)
+                    print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+                except TypeError:
+                    bpy.ops.wm.obj_export(filepath=obj_path)
+                    print(f"OBJをエクスポートしました（頂点色オプションは未対応の可能性）: {obj_path}")
+            except AttributeError:
+                # レガシー export_scene.obj にフォールバック
+                try:
+                    bpy.ops.export_scene.obj(filepath=obj_path, use_selection=True, use_materials=False, export_colors=True)
+                    print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+                except Exception as e:
+                    print(f"OBJエクスポート失敗: {e}")
+        else:
+            # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
+            try:
+                bpy.ops.export_mesh.threemf(filepath=OUTPUT_PATH)
                 print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
             except AttributeError:
-                print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
-                print("エクスポートパス:", OUTPUT_PATH)
+                try:
+                    bpy.ops.export_mesh.three_mf(filepath=OUTPUT_PATH)
+                    print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
+                except AttributeError:
+                    print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
+                    print("エクスポートパス:", OUTPUT_PATH)
 
         # エクスポート用コピーを削除（名前で再取得して参照無効化を回避）
         for name in export_object_names:
