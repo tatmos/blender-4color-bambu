@@ -8,6 +8,7 @@ import bmesh
 OUTPUT_PATH = "D:/3DCG/output_4colors_quantized_only.3mf"
 NUM_COLORS = 4
 KMEANS_ITERATIONS = 20
+EXPORT_SCALE = 0.1  # 出力サイズを10%に
 
 
 def get_face_colors_from_mesh(obj):
@@ -20,12 +21,54 @@ def get_face_colors_from_mesh(obj):
     bm.from_mesh(mesh)
     bm.verts.ensure_lookup_table()
 
-    # 頂点色レイヤーを探す（Blender 4.0+ は "Color" や col 属性）
+    # 頂点色レイヤーを探す（byte "Color" 優先 → byte 最初 → float "Color" → float 最初）
     color_layer = None
-    if bm.loops.layers.color:
-        color_layer = bm.loops.layers.color.active
-        if color_layer is None:
-            color_layer = bm.loops.layers.color.get("Color") or next(iter(bm.loops.layers.color), None)
+    layer_name_used = None
+    use_float_layer = False
+
+    def pick_byte_color_layer():
+        nonlocal color_layer, layer_name_used
+        if not getattr(bm.loops.layers, "color", None) or not bm.loops.layers.color:
+            return
+        layers = bm.loops.layers.color
+        color_layer = layers.get("Color")
+        if color_layer is not None:
+            layer_name_used = "Color"
+            return
+        if getattr(layers, "active", None) is not None:
+            color_layer = layers.active
+            layer_name_used = "active"
+            return
+        for name, layer in layers.items():
+            color_layer = layer
+            layer_name_used = name
+            return
+
+    def pick_float_color_layer():
+        nonlocal color_layer, layer_name_used, use_float_layer
+        if not getattr(bm.loops.layers, "float_color", None) or not bm.loops.layers.float_color:
+            return
+        layers = bm.loops.layers.float_color
+        layer = layers.get("Color")
+        if layer is not None:
+            layer_name_used = "Color"
+        elif getattr(layers, "active", None) is not None:
+            layer = layers.active
+            layer_name_used = "active"
+        else:
+            for name, l in layers.items():
+                layer = l
+                layer_name_used = name
+                break
+        if layer is not None:
+            color_layer = layer
+            use_float_layer = True
+
+    pick_byte_color_layer()
+    if color_layer is None:
+        pick_float_color_layer()
+    if layer_name_used:
+        print(f"  頂点色レイヤーを使用: \"{layer_name_used}\" ({'float' if use_float_layer else 'byte'}) (オブジェクト: {obj.name})")
 
     face_colors = []
     has_vertex_color = color_layer is not None
@@ -36,9 +79,10 @@ def get_face_colors_from_mesh(obj):
             n = len(face.loops)
             for loop in face.loops:
                 c = loop[color_layer]
-                r += c[0]
-                g += c[1]
-                b += c[2]
+                # byte は 0-1 で渡ってくる想定。float も 0-1
+                r += float(c[0])
+                g += float(c[1])
+                b += float(c[2])
             face_colors.append((r / n, g / n, b / n))
     else:
         # マテリアルベース: 面のマテリアルインデックスからベースカラー取得
@@ -106,6 +150,22 @@ def quantize_colors_kmeans(face_colors, k=4, max_iter=20):
     return [tuple(c) for c in centroids], assignments
 
 
+def ensure_distinct_palette(palette, k=4):
+    """パレットがほぼ同じ色（例: 全部白）なら、視覚的に区別しやすい4色に置き換える。"""
+    if len(palette) < k:
+        palette = list(palette) + [(0.2, 0.2, 0.2)] * (k - len(palette))
+    # パレット内の明るさ・ばらつきを簡易チェック
+    lum = [0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in palette]
+    avg_lum = sum(lum) / len(lum)
+    variance = sum((x - avg_lum) ** 2 for x in lum) / len(lum)
+    # ほぼ同じ明るさで分散が小さい → 区別しやすい4色に
+    if variance < 0.01 and avg_lum > 0.85:
+        return [(0.9, 0.2, 0.2), (0.2, 0.5, 0.9), (0.2, 0.75, 0.3), (0.9, 0.85, 0.2)]  # 赤・青・緑・黄
+    if variance < 0.01 and avg_lum < 0.2:
+        return [(0.9, 0.25, 0.25), (0.25, 0.5, 0.9), (0.25, 0.8, 0.35), (0.95, 0.9, 0.25)]
+    return list(palette)[:k]
+
+
 def mesh_split_by_color(obj, face_colors, assignments, palette):
     """メッシュを色ごとに分割し、各色で新しいオブジェクトを作成。"""
     mesh = obj.data
@@ -141,6 +201,9 @@ def mesh_split_by_color(obj, face_colors, assignments, palette):
 
         new_mesh = bpy.data.meshes.new(name=f"{obj.name}_color{color_idx}")
         new_mesh.from_pydata(new_verts, [], new_faces)
+        # 全ポリゴンにマテリアル0を割り当て（後でマテリアルを1つ追加する）
+        for poly in new_mesh.polygons:
+            poly.material_index = 0
         new_mesh.update()
 
         new_obj = bpy.data.objects.new(name=f"{obj.name}_color{color_idx}", object_data=new_mesh)
@@ -195,6 +258,7 @@ def process_scene():
             continue
 
         palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
+        palette = ensure_distinct_palette(palette, k=NUM_COLORS)
         new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
         created.extend(new_objs)
 
@@ -202,10 +266,17 @@ def process_scene():
         print("分割できるメッシュがありません。")
         return
 
-    # エクスポート用に分割オブジェクトのみ選択
+    # エクスポート用に分割オブジェクトのみ選択し、スケールを適用
     bpy.ops.object.select_all(action="DESELECT")
     for o in created:
         o.select_set(True)
+    view_layer.objects.active = created[0]
+
+    # 出力スケール（10%）を適用
+    if EXPORT_SCALE != 1.0:
+        for o in created:
+            o.scale *= EXPORT_SCALE
+        bpy.ops.object.transform_apply(scale=True)
 
     # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
     try:
