@@ -13,6 +13,9 @@ USE_SELECTION_ONLY = True  # True: 選択されたメッシュのみ処理（1�
 BAKE_TO_VERTEX_COLOR = True  # True: 表示色を頂点カラーにベイクしてから減色（テクスチャ等も反映）
 BAKE_TARGET_ATTR_NAME = "Col"  # ベイク先のカラー属性名（"Col" で既存を上書き / "Color" で新規）
 
+# エクスポートモード: "split" = 色ごとにメッシュ分割（従来）, "vertex_color_only" = 分割せず頂点色のみ（非多様体回避）
+EXPORT_MODE = "vertex_color_only"  # 非多様体エッジを避けたい場合はこのまま。従来どおり分割したい場合は "split"
+
 
 def ensure_bake_target_color_attribute(mesh, name):
     """メッシュにカラー属性がなければ追加。ドメインは FACE_CORNER（ループ）。"""
@@ -284,6 +287,49 @@ def mesh_split_by_color(obj, face_colors, assignments, palette):
     return new_objects
 
 
+def apply_quantized_vertex_colors(obj, face_colors, assignments, palette, attr_name=None):
+    """
+    メッシュを分割せず、減色した色を頂点カラー（面コーナー）に書き戻す。
+    1メッシュのままなので非多様体エッジは発生しない。
+    """
+    mesh = obj.data
+    if not mesh.polygons or not mesh.loops:
+        return False
+    attr_name = attr_name or BAKE_TARGET_ATTR_NAME
+    # カラー属性を用意（byte, CORNER）
+    idx = mesh.color_attributes.find(attr_name)
+    if idx < 0:
+        mesh.color_attributes.new(name=attr_name, type="BYTE_COLOR", domain="CORNER")
+        idx = mesh.color_attributes.find(attr_name)
+    if idx < 0:
+        return False
+    mesh.color_attributes.active_color_index = idx
+
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bm.verts.ensure_lookup_table()
+    color_layer = bm.loops.layers.color.get(attr_name)
+    if color_layer is None:
+        color_layer = bm.loops.layers.color.get("Col") or bm.loops.layers.color.get("Color")
+    if color_layer is None and bm.loops.layers.color:
+        for name, layer in bm.loops.layers.color.items():
+            color_layer = layer
+            break
+    if color_layer is None:
+        color_layer = bm.loops.layers.color.new(attr_name)
+
+    for face_idx, face in enumerate(bm.faces):
+        color_idx = assignments[face_idx] if face_idx < len(assignments) else 0
+        c = palette[color_idx] if color_idx < len(palette) else (0.5, 0.5, 0.5)
+        for loop in face.loops:
+            loop[color_layer] = (c[0], c[1], c[2], 1.0)
+
+    bm.to_mesh(mesh)
+    mesh.update()
+    bm.free()
+    return True
+
+
 def process_scene():
     """選択メッシュを4色減色・分割し、3MFエクスポートする。"""
     scene = bpy.context.scene
@@ -321,80 +367,122 @@ def process_scene():
             else:
                 print(f"    スキップまたは失敗: {obj.name}")
 
-    # 既存の「分割済み」オブジェクトを削除するかはオプション。ここでは新規作成のみ。
+    # EXPORT_MODE に応じて「分割」するか「頂点色のみ書き戻し」か
     created = []
-    for obj in candidates:
-        bpy.ops.object.select_all(action="DESELECT")
-        obj.select_set(True)
-        view_layer.objects.active = obj
+    if EXPORT_MODE == "vertex_color_only":
+        # 分割せず、減色した色を頂点カラーに書き戻すだけ（1メッシュのまま → 非多様体回避）
+        print("[調査] モード: vertex_color_only（分割せず頂点色のみ）")
+        for obj in candidates:
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            view_layer.objects.active = obj
+            has_vcol, face_colors = get_face_colors_from_mesh(obj)
+            if not face_colors:
+                continue
+            palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
+            if len(set(assignments)) < 2:
+                assignments = [i % NUM_COLORS for i in range(len(assignments))]
+                print("  頂点色が一色のため、面を均等に4色に割り当てました。")
+            palette = ensure_distinct_palette(palette, k=NUM_COLORS)
+            if apply_quantized_vertex_colors(obj, face_colors, assignments, palette):
+                created.append(obj)
+                print(f"  頂点色を適用: {obj.name}")
+            else:
+                print(f"  頂点色適用スキップ: {obj.name}")
+        if not created:
+            print("頂点色を適用できるメッシュがありません。")
+            return
+        print(f"[調査] 頂点色を適用したオブジェクト: {len(created)} 個（メッシュは分割していません）")
+    else:
+        # 従来: 色ごとにメッシュ分割
+        print("[調査] モード: split（色ごとにメッシュ分割）")
+        for obj in candidates:
+            bpy.ops.object.select_all(action="DESELECT")
+            obj.select_set(True)
+            view_layer.objects.active = obj
+            has_vcol, face_colors = get_face_colors_from_mesh(obj)
+            if not face_colors:
+                continue
+            palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
+            if len(set(assignments)) < 2:
+                assignments = [i % NUM_COLORS for i in range(len(assignments))]
+                print("  頂点色が一色のため、面を均等に4分割しました。")
+            palette = ensure_distinct_palette(palette, k=NUM_COLORS)
+            new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
+            created.extend(new_objs)
+        if not created:
+            print("分割できるメッシュがありません。")
+            return
+        print(f"[調査] 作成した分割オブジェクト: {len(created)} 個（色ごと）")
+    if EXPORT_MODE != "vertex_color_only":
+        for i, o in enumerate(created):
+            mat_info = ""
+            if o.data.materials:
+                mat = o.data.materials[0]
+                if mat and mat.node_tree and mat.node_tree.nodes:
+                    for n in mat.node_tree.nodes:
+                        if n.type == "BSDF_PRINCIPLED":
+                            col = n.inputs["Base Color"].default_value
+                            mat_info = f" RGB({col[0]:.2f},{col[1]:.2f},{col[2]:.2f})"
+                            break
+            print(f"  - [{i}] {o.name}{mat_info}")
 
-        has_vcol, face_colors = get_face_colors_from_mesh(obj)
-        if not face_colors:
-            continue
-
-        palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
-        # 頂点色がほぼ一色だと全面が同じクラスタ(0)になる → 面を均等に4分割する
-        if len(set(assignments)) < 2:
-            assignments = [i % NUM_COLORS for i in range(len(assignments))]
-            print("  頂点色が一色のため、面を均等に4分割しました。")
-        palette = ensure_distinct_palette(palette, k=NUM_COLORS)
-        new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
-        created.extend(new_objs)
-
-    if not created:
-        print("分割できるメッシュがありません。")
-        return
-
-    print(f"[調査] 作成した分割オブジェクト: {len(created)} 個（色ごと）")
-    for i, o in enumerate(created):
-        mat_info = ""
-        if o.data.materials:
-            mat = o.data.materials[0]
-            if mat and mat.node_tree and mat.node_tree.nodes:
-                for n in mat.node_tree.nodes:
-                    if n.type == "BSDF_PRINCIPLED":
-                        col = n.inputs["Base Color"].default_value
-                        mat_info = f" RGB({col[0]:.2f},{col[1]:.2f},{col[2]:.2f})"
-                        break
-        print(f"  - [{i}] {o.name}{mat_info}")
-
-    # 元オブジェクトをシーンから一時的に外す（コレクションから unlink → 3MF に絶対含まれないようにする）
-    restored_collections = []  # (obj, [col, col, ...])
-    for obj in candidates:
-        cols = list(obj.users_collection)
-        restored_collections.append((obj, cols))
-        for c in cols:
-            c.objects.unlink(obj)
-    print("[調査] 元オブジェクトをコレクションから外しました（エクスポート後に復元します）")
-
-    created_collections = []  # finally で分割オブジェクトを戻す用
-    try:
-        # エクスポート用にコピーを作成（Blender上の created はスケールをいじらない）
-        export_objects = []
-        for obj in created:
-            mesh_copy = obj.data.copy()
-            obj_copy = bpy.data.objects.new(name=obj.name + "_export", object_data=mesh_copy)
-            obj_copy.matrix_world = obj.matrix_world.copy()
-            obj_copy.data.materials.clear()
-            for slot in obj.data.material_slots:
-                if slot.material:
-                    obj_copy.data.materials.append(slot.material)
-            bpy.context.collection.objects.link(obj_copy)
-            export_objects.append(obj_copy)
-
-        # エクスポート時は分割オブジェクト（created）を一時的に外し、コピーだけ残す
-        created_collections = []
-        for obj in created:
+    # 分割モード時のみ「元の候補オブジェクト」をシーンから外す（3MF に含めない）
+    restored_collections = []  # [(obj_name, [col_name, ...]), ...] 名前で保存して参照無効化を回避
+    if EXPORT_MODE == "split":
+        for obj in candidates:
             cols = list(obj.users_collection)
-            created_collections.append((obj, cols))
+            restored_collections.append((obj.name, [c.name for c in cols]))
             for c in cols:
                 c.objects.unlink(obj)
+        print("[調査] 元オブジェクトをコレクションから外しました（エクスポート後に復元します）")
+
+    # エクスポート時は created を一時的に外し、コピーだけをシーンに残してエクスポート
+    # 復元時は名前で再取得するため、参照無効化（StructRNA removed）を防ぐ
+    created_collections = []  # [(obj_name, [col_name, ...]), ...]
+    for obj in created:
+        if hasattr(obj, "users_collection"):
+            cols = list(obj.users_collection)
+            created_collections.append((obj.name, [c.name for c in cols]))
+            for c in cols:
+                c.objects.unlink(obj)
+        else:
+            created_collections.append((getattr(obj, "name", ""), []))
+
+    try:
+        # エクスポート用にコピーを作成（Blender上の created はスケールをいじらない）
+        # created の要素は Object 想定。Object は material_slots / .data を持つ。Mesh の場合は .materials のみ。
+        export_objects = []
+        export_object_names = []  # 削除時に参照無効化を避けるため名前を保持
+        for obj in created:
+            if hasattr(obj, "material_slots") and hasattr(obj, "data"):
+                mesh_copy = obj.data.copy()
+                obj_copy = bpy.data.objects.new(name=obj.name + "_export", object_data=mesh_copy)
+                obj_copy.matrix_world = obj.matrix_world.copy()
+                obj_copy.data.materials.clear()
+                for slot in obj.material_slots:
+                    if slot.material:
+                        obj_copy.data.materials.append(slot.material)
+            else:
+                mesh_copy = obj.copy()
+                obj_copy = bpy.data.objects.new(name=getattr(obj, "name", "mesh") + "_export", object_data=mesh_copy)
+                obj_copy.matrix_world = __import__("mathutils").Matrix.Identity(4)
+                obj_copy.data.materials.clear()
+                for mat in getattr(obj, "materials", []):
+                    if mat:
+                        obj_copy.data.materials.append(mat)
+            bpy.context.collection.objects.link(obj_copy)
+            export_objects.append(obj_copy)
+            export_object_names.append(obj_copy.name)
+
+        # エクスポート用に created を一時外した分は上で created_collections に済み（重複ループ削除）
 
         # コピーだけ選択し、トランスフォームをメッシュに焼き込んでからスケール適用
         bpy.ops.object.select_all(action="DESELECT")
         for o in export_objects:
             o.select_set(True)
-        view_layer.objects.active = export_objects[0]
+        if export_objects:
+            view_layer.objects.active = export_objects[0]
 
         # ワールド空間に統一
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
@@ -417,19 +505,44 @@ def process_scene():
                 print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
                 print("エクスポートパス:", OUTPUT_PATH)
 
-        # エクスポート用コピーを削除
-        for obj in export_objects:
-            bpy.data.meshes.remove(obj.data, do_unlink=True)
-            bpy.data.objects.remove(obj, do_unlink=True)
+        # エクスポート用コピーを削除（名前で再取得して参照無効化を回避）
+        for name in export_object_names:
+            obj = bpy.data.objects.get(name)
+            if obj is not None:
+                mesh = obj.data
+                bpy.data.objects.remove(obj, do_unlink=True)
+                if mesh and mesh.users == 0:
+                    bpy.data.meshes.remove(mesh, do_unlink=True)
     finally:
-        # 分割オブジェクト（created）をコレクションに戻す（エクスポート用に外していた分）
-        for obj, cols in created_collections:
-            for c in cols:
-                c.objects.link(obj)
-        # 元オブジェクトをコレクションに戻す
-        for obj, cols in restored_collections:
-            for c in cols:
-                c.objects.link(obj)
+        # 分割オブジェクト（created）をコレクションに戻す（名前で再取得。参照無効化時も落ちないよう try で保護）
+        for obj_name, col_names in created_collections:
+            try:
+                obj = bpy.data.objects.get(obj_name)
+                if obj is None:
+                    continue
+                for col_name in col_names:
+                    c = bpy.data.collections.get(col_name)
+                    if c is not None:
+                        try:
+                            c.objects.link(obj)
+                        except (ReferenceError, RuntimeError):
+                            pass
+            except ReferenceError:
+                pass
+        for obj_name, col_names in restored_collections:
+            try:
+                obj = bpy.data.objects.get(obj_name)
+                if obj is None:
+                    continue
+                for col_name in col_names:
+                    c = bpy.data.collections.get(col_name)
+                    if c is not None:
+                        try:
+                            c.objects.link(obj)
+                        except (ReferenceError, RuntimeError):
+                            pass
+            except ReferenceError:
+                pass
         print("[調査] 元オブジェクトをコレクションに戻しました。")
 
 
