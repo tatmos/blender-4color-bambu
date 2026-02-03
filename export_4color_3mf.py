@@ -367,20 +367,40 @@ def process_scene():
             c.objects.unlink(obj)
     print("[調査] 元オブジェクトをコレクションから外しました（エクスポート後に復元します）")
 
+    created_collections = []  # finally で分割オブジェクトを戻す用
     try:
-        # エクスポート用に分割オブジェクトのみ選択
+        # エクスポート用にコピーを作成（Blender上の created はスケールをいじらない）
+        export_objects = []
+        for obj in created:
+            mesh_copy = obj.data.copy()
+            obj_copy = bpy.data.objects.new(name=obj.name + "_export", object_data=mesh_copy)
+            obj_copy.matrix_world = obj.matrix_world.copy()
+            obj_copy.data.materials.clear()
+            for slot in obj.data.material_slots:
+                if slot.material:
+                    obj_copy.data.materials.append(slot.material)
+            bpy.context.collection.objects.link(obj_copy)
+            export_objects.append(obj_copy)
+
+        # エクスポート時は分割オブジェクト（created）を一時的に外し、コピーだけ残す
+        created_collections = []
+        for obj in created:
+            cols = list(obj.users_collection)
+            created_collections.append((obj, cols))
+            for c in cols:
+                c.objects.unlink(obj)
+
+        # コピーだけ選択し、トランスフォームをメッシュに焼き込んでからスケール適用
         bpy.ops.object.select_all(action="DESELECT")
-        for o in created:
+        for o in export_objects:
             o.select_set(True)
-        view_layer.objects.active = created[0]
+        view_layer.objects.active = export_objects[0]
 
-        # まず各オブジェクトのトランスフォームをメッシュに焼き込む（ワールド空間に統一）
-        # これで元オブジェクトごとのスケール差がなくなり、全オブジェクトが同じ基準になる
+        # ワールド空間に統一
         bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
-
-        # そのうえで出力スケール（10%）を適用
+        # 出力スケール（10%）をメッシュに適用（Blender上のオブジェクトはそのまま）
         if EXPORT_SCALE != 1.0:
-            for o in created:
+            for o in export_objects:
                 o.scale *= EXPORT_SCALE
             bpy.ops.object.transform_apply(scale=True)
 
@@ -396,7 +416,16 @@ def process_scene():
             except AttributeError:
                 print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
                 print("エクスポートパス:", OUTPUT_PATH)
+
+        # エクスポート用コピーを削除
+        for obj in export_objects:
+            bpy.data.meshes.remove(obj.data, do_unlink=True)
+            bpy.data.objects.remove(obj, do_unlink=True)
     finally:
+        # 分割オブジェクト（created）をコレクションに戻す（エクスポート用に外していた分）
+        for obj, cols in created_collections:
+            for c in cols:
+                c.objects.link(obj)
         # 元オブジェクトをコレクションに戻す
         for obj, cols in restored_collections:
             for c in cols:
