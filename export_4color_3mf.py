@@ -9,6 +9,7 @@ OUTPUT_PATH = "D:/3DCG/output_4colors_quantized_only.3mf"
 NUM_COLORS = 4
 KMEANS_ITERATIONS = 20
 EXPORT_SCALE = 0.1  # 出力サイズを10%に
+USE_SELECTION_ONLY = True  # True: 選択されたメッシュのみ処理（1体だけ出力したい場合は1つだけ選択）
 
 
 def get_face_colors_from_mesh(obj):
@@ -21,7 +22,7 @@ def get_face_colors_from_mesh(obj):
     bm.from_mesh(mesh)
     bm.verts.ensure_lookup_table()
 
-    # 頂点色レイヤーを探す（byte "Color" 優先 → byte 最初 → float "Color" → float 最初）
+    # 頂点色レイヤーを探す（"Color" → "Col"（Tripo/OBJ等）→ active → 最初のレイヤー）
     color_layer = None
     layer_name_used = None
     use_float_layer = False
@@ -31,10 +32,11 @@ def get_face_colors_from_mesh(obj):
         if not getattr(bm.loops.layers, "color", None) or not bm.loops.layers.color:
             return
         layers = bm.loops.layers.color
-        color_layer = layers.get("Color")
-        if color_layer is not None:
-            layer_name_used = "Color"
-            return
+        for preferred in ("Color", "Col"):
+            color_layer = layers.get(preferred)
+            if color_layer is not None:
+                layer_name_used = preferred
+                return
         if getattr(layers, "active", None) is not None:
             color_layer = layers.active
             layer_name_used = "active"
@@ -49,13 +51,17 @@ def get_face_colors_from_mesh(obj):
         if not getattr(bm.loops.layers, "float_color", None) or not bm.loops.layers.float_color:
             return
         layers = bm.loops.layers.float_color
-        layer = layers.get("Color")
-        if layer is not None:
-            layer_name_used = "Color"
-        elif getattr(layers, "active", None) is not None:
+        for preferred in ("Color", "Col"):
+            layer = layers.get(preferred)
+            if layer is not None:
+                layer_name_used = preferred
+                break
+        else:
+            layer = None
+        if layer is None and getattr(layers, "active", None) is not None:
             layer = layers.active
             layer_name_used = "active"
-        else:
+        elif layer is None:
             for name, l in layers.items():
                 layer = l
                 layer_name_used = name
@@ -157,11 +163,11 @@ def ensure_distinct_palette(palette, k=4):
     # パレット内の明るさ・ばらつきを簡易チェック
     lum = [0.299 * c[0] + 0.587 * c[1] + 0.114 * c[2] for c in palette]
     avg_lum = sum(lum) / len(lum)
-    variance = sum((x - avg_lum) ** 2 for x in lum) / len(lum)
-    # ほぼ同じ明るさで分散が小さい → 区別しやすい4色に
-    if variance < 0.01 and avg_lum > 0.85:
+    variance = sum((x - avg_lum) ** 2 for x in lum) / max(len(lum), 1)
+    # ほぼ同じ明るさで分散が小さい → 区別しやすい4色に（白っぽい or 黒っぽい）
+    if variance < 0.02 and avg_lum > 0.8:
         return [(0.9, 0.2, 0.2), (0.2, 0.5, 0.9), (0.2, 0.75, 0.3), (0.9, 0.85, 0.2)]  # 赤・青・緑・黄
-    if variance < 0.01 and avg_lum < 0.2:
+    if variance < 0.02 and avg_lum < 0.25:
         return [(0.9, 0.25, 0.25), (0.25, 0.5, 0.9), (0.25, 0.8, 0.35), (0.95, 0.9, 0.25)]
     return list(palette)[:k]
 
@@ -236,15 +242,24 @@ def process_scene():
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
 
-    # 対象: 選択中のメッシュオブジェクト（未選択なら全メッシュ）
-    if bpy.context.selected_objects:
+    # 対象: USE_SELECTION_ONLY のときは選択メッシュのみ、そうでなければ全メッシュ
+    if USE_SELECTION_ONLY:
         candidates = [o for o in bpy.context.selected_objects if o.type == "MESH"]
+        if not candidates:
+            print("メッシュオブジェクトを1つ以上選択してから実行してください。（1体だけ出力する場合は1つだけ選択）")
+            return
+        print(f"[調査] 処理対象: 選択されたメッシュ {len(candidates)} 個")
     else:
-        candidates = [o for o in scene.objects if o.type == "MESH"]
-
+        if bpy.context.selected_objects:
+            candidates = [o for o in bpy.context.selected_objects if o.type == "MESH"]
+        else:
+            candidates = [o for o in scene.objects if o.type == "MESH"]
+        print(f"[調査] 処理対象: メッシュ {len(candidates)} 個")
     if not candidates:
         print("メッシュオブジェクトがありません。")
         return
+    for i, o in enumerate(candidates):
+        print(f"  - [{i}] {o.name}")
 
     # 既存の「分割済み」オブジェクトを削除するかはオプション。ここでは新規作成のみ。
     created = []
@@ -258,6 +273,10 @@ def process_scene():
             continue
 
         palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
+        # 頂点色がほぼ一色だと全面が同じクラスタ(0)になる → 面を均等に4分割する
+        if len(set(assignments)) < 2:
+            assignments = [i % NUM_COLORS for i in range(len(assignments))]
+            print("  頂点色が一色のため、面を均等に4分割しました。")
         palette = ensure_distinct_palette(palette, k=NUM_COLORS)
         new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
         created.extend(new_objs)
@@ -266,30 +285,63 @@ def process_scene():
         print("分割できるメッシュがありません。")
         return
 
-    # エクスポート用に分割オブジェクトのみ選択し、スケールを適用
-    bpy.ops.object.select_all(action="DESELECT")
-    for o in created:
-        o.select_set(True)
-    view_layer.objects.active = created[0]
+    print(f"[調査] 作成した分割オブジェクト: {len(created)} 個（色ごと）")
+    for i, o in enumerate(created):
+        mat_info = ""
+        if o.data.materials:
+            mat = o.data.materials[0]
+            if mat and mat.node_tree and mat.node_tree.nodes:
+                for n in mat.node_tree.nodes:
+                    if n.type == "BSDF_PRINCIPLED":
+                        col = n.inputs["Base Color"].default_value
+                        mat_info = f" RGB({col[0]:.2f},{col[1]:.2f},{col[2]:.2f})"
+                        break
+        print(f"  - [{i}] {o.name}{mat_info}")
 
-    # 出力スケール（10%）を適用
-    if EXPORT_SCALE != 1.0:
-        for o in created:
-            o.scale *= EXPORT_SCALE
-        bpy.ops.object.transform_apply(scale=True)
+    # 元オブジェクトをシーンから一時的に外す（コレクションから unlink → 3MF に絶対含まれないようにする）
+    restored_collections = []  # (obj, [col, col, ...])
+    for obj in candidates:
+        cols = list(obj.users_collection)
+        restored_collections.append((obj, cols))
+        for c in cols:
+            c.objects.unlink(obj)
+    print("[調査] 元オブジェクトをコレクションから外しました（エクスポート後に復元します）")
 
-    # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
     try:
-        bpy.ops.export_mesh.threemf(filepath=OUTPUT_PATH)
-        print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
-    except AttributeError:
-        # アドオンが three_mf などの別名で登録している場合
+        # エクスポート用に分割オブジェクトのみ選択
+        bpy.ops.object.select_all(action="DESELECT")
+        for o in created:
+            o.select_set(True)
+        view_layer.objects.active = created[0]
+
+        # まず各オブジェクトのトランスフォームをメッシュに焼き込む（ワールド空間に統一）
+        # これで元オブジェクトごとのスケール差がなくなり、全オブジェクトが同じ基準になる
+        bpy.ops.object.transform_apply(location=True, rotation=True, scale=True)
+
+        # そのうえで出力スケール（10%）を適用
+        if EXPORT_SCALE != 1.0:
+            for o in created:
+                o.scale *= EXPORT_SCALE
+            bpy.ops.object.transform_apply(scale=True)
+
+        # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
         try:
-            bpy.ops.export_mesh.three_mf(filepath=OUTPUT_PATH)
+            bpy.ops.export_mesh.threemf(filepath=OUTPUT_PATH)
             print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
         except AttributeError:
-            print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
-            print("エクスポートパス:", OUTPUT_PATH)
+            # アドオンが three_mf などの別名で登録している場合
+            try:
+                bpy.ops.export_mesh.three_mf(filepath=OUTPUT_PATH)
+                print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
+            except AttributeError:
+                print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
+                print("エクスポートパス:", OUTPUT_PATH)
+    finally:
+        # 元オブジェクトをコレクションに戻す
+        for obj, cols in restored_collections:
+            for c in cols:
+                c.objects.link(obj)
+        print("[調査] 元オブジェクトをコレクションに戻しました。")
 
 
 if __name__ == "__main__":
