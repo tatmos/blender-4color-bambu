@@ -67,6 +67,7 @@ Blender 5.0.1 でメッシュを **4色に減色** し、**3MF** または **頂
 | `BAKE_TO_VERTEX_COLOR` | True なら表示色（テクスチャ含む）を頂点カラーにベイクしてから減色 |
 | `BAKE_TARGET_ATTR_NAME` | ベイク先のカラー属性名（"Col" で既存を上書き / "Color" で新規） |
 | `EXPORT_MODE` | `"split"` = 色ごとにメッシュ分割（従来）, `"vertex_color_only"` = 分割せず頂点色のみ（非多様体回避） |
+| `PROGRESS_LOG_INTERVAL` | 進捗ログを出す間隔（面数）。5000 = 5000 面ごとにログ出力。0 で無効。大量頂点で応答なしに見えるときの目安用。 |
 
 ## エクスポートモード（EXPORT_MODE）と非多様体エッジ回避
 

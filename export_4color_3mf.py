@@ -18,6 +18,9 @@ BAKE_TARGET_ATTR_NAME = "Col"  # ベイク先のカラー属性名（"Col" で�
 # エクスポートモード: "split" = 色ごとにメッシュ分割（従来）, "vertex_color_only" = 分割せず頂点色のみ（非多様体回避）
 EXPORT_MODE = "vertex_color_only"  # 非多様体エッジを避けたい場合はこのまま。従来どおり分割したい場合は "split"
 
+# 進捗ログ: この件数ごとにコンソールに出力（0 で無効）
+PROGRESS_LOG_INTERVAL = 5000
+
 
 def ensure_bake_target_color_attribute(mesh, name):
     """メッシュにカラー属性がなければ追加。ドメインは FACE_CORNER（ループ）。"""
@@ -130,9 +133,13 @@ def get_face_colors_from_mesh(obj):
 
     face_colors = []
     has_vertex_color = color_layer is not None
+    n_faces = len(bm.faces)
+    log_interval = PROGRESS_LOG_INTERVAL if PROGRESS_LOG_INTERVAL > 0 else n_faces + 1
 
     if has_vertex_color:
-        for face in bm.faces:
+        for fi, face in enumerate(bm.faces):
+            if (fi + 1) % log_interval == 0 or fi == 0 or fi == n_faces - 1:
+                print(f"    面の色取得: {fi + 1}/{n_faces}")
             r, g, b = 0.0, 0.0, 0.0
             n = len(face.loops)
             for loop in face.loops:
@@ -144,7 +151,9 @@ def get_face_colors_from_mesh(obj):
             face_colors.append((r / n, g / n, b / n))
     else:
         # マテリアルベース: 面のマテリアルインデックスからベースカラー取得
-        for face in bm.faces:
+        for fi, face in enumerate(bm.faces):
+            if (fi + 1) % log_interval == 0 or fi == 0 or fi == n_faces - 1:
+                print(f"    面の色取得: {fi + 1}/{n_faces}")
             mat_index = face.material_index
             if mat_index is not None and mat_index < len(obj.material_slots):
                 mat = obj.material_slots[mat_index].material
@@ -181,8 +190,14 @@ def quantize_colors_kmeans(face_colors, k=4, max_iter=20):
     def dist(a, b):
         return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
 
+    n_fc = len(face_colors)
+    if PROGRESS_LOG_INTERVAL > 0 and n_fc >= PROGRESS_LOG_INTERVAL:
+        print(f"  K-means 減色中: {n_fc} 面, {max_iter} 反復")
+
     assignments = [0] * len(face_colors)
-    for _ in range(max_iter):
+    for it in range(max_iter):
+        if PROGRESS_LOG_INTERVAL > 0 and n_fc >= PROGRESS_LOG_INTERVAL and (it + 1) % max(1, max_iter // 4) == 0:
+            print(f"    反復 {it + 1}/{max_iter}")
         # assign
         for i, c in enumerate(face_colors):
             best = 0
@@ -234,7 +249,13 @@ def mesh_split_by_color(obj, face_colors, assignments, palette):
     # 色インデックスごとに面をグループ化（頂点はグローバルインデックスで管理）
     from collections import defaultdict
     groups = defaultdict(list)  # color_index -> list of (verts_indices, face_as_vertex_indices)
+    n_faces = len(bm.faces)
+    log_interval = PROGRESS_LOG_INTERVAL if PROGRESS_LOG_INTERVAL > 0 else n_faces + 1
+    if log_interval <= n_faces:
+        print(f"  メッシュ分割: {n_faces} 面を色ごとにグループ化中")
     for face_idx, face in enumerate(bm.faces):
+        if (face_idx + 1) % log_interval == 0 or face_idx == 0 or face_idx == n_faces - 1:
+            print(f"    面グループ化: {face_idx + 1}/{n_faces}")
         color_idx = assignments[face_idx] if face_idx < len(assignments) else 0
         vert_indices = [v.index for v in face.verts]
         groups[color_idx].append(vert_indices)
@@ -246,6 +267,8 @@ def mesh_split_by_color(obj, face_colors, assignments, palette):
     for color_idx, face_vert_lists in groups.items():
         if not face_vert_lists:
             continue
+        if PROGRESS_LOG_INTERVAL > 0:
+            print(f"    色 {color_idx}: {len(face_vert_lists)} 面のメッシュ作成中")
 
         # このグループで使う頂点のユニーク集合と、旧インデックス→新インデックス
         all_verts = set()
@@ -320,7 +343,11 @@ def apply_quantized_vertex_colors(obj, face_colors, assignments, palette, attr_n
     if color_layer is None:
         color_layer = bm.loops.layers.color.new(attr_name)
 
+    n_faces = len(bm.faces)
+    log_interval = PROGRESS_LOG_INTERVAL if PROGRESS_LOG_INTERVAL > 0 else n_faces + 1
     for face_idx, face in enumerate(bm.faces):
+        if (face_idx + 1) % log_interval == 0 or face_idx == 0 or face_idx == n_faces - 1:
+            print(f"    頂点色書き戻し: {face_idx + 1}/{n_faces}")
         color_idx = assignments[face_idx] if face_idx < len(assignments) else 0
         c = palette[color_idx] if color_idx < len(palette) else (0.5, 0.5, 0.5)
         for loop in face.loops:
