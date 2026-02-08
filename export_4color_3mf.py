@@ -3,6 +3,7 @@
 
 import bpy
 import bmesh
+from bpy_extras.io_utils import ExportHelper
 
 # ---------- 設定 ----------
 OUTPUT_PATH = "D:/3DCG/output_4colors_quantized_only.3mf"
@@ -359,16 +360,31 @@ def apply_quantized_vertex_colors(obj, face_colors, assignments, palette, attr_n
     return True
 
 
-def process_scene():
-    """選択メッシュを4色減色・分割し、3MFエクスポートする。"""
+def process_scene(output_path=None, report_fn=None):
+    """選択メッシュを4色減色・分割し、3MF/OBJエクスポートする。output_path が None のときは OUTPUT_PATH を使用。"""
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
+
+    # 保存パス: 渡されていればそれを使用、なければ設定の OUTPUT_PATH
+    effective_path = (output_path or OUTPUT_PATH).rstrip()
+    # 拡張子からエクスポート形式を判定（.obj → OBJ、それ以外 → 3MF）
+    export_format_from_path = "obj" if effective_path.lower().endswith(".obj") else "3mf"
+
+    def report(msg):
+        if report_fn:
+            report_fn(msg)
+        print(msg)
+
+    report("4色減色・エクスポートを開始します")
 
     # 対象: USE_SELECTION_ONLY のときは選択メッシュのみ、そうでなければ全メッシュ
     if USE_SELECTION_ONLY:
         candidates = [o for o in bpy.context.selected_objects if o.type == "MESH"]
         if not candidates:
-            print("メッシュオブジェクトを1つ以上選択してから実行してください。（1体だけ出力する場合は1つだけ選択）")
+            msg = "メッシュオブジェクトを1つ以上選択してから実行してください。（1体だけ出力する場合は1つだけ選択）"
+            print(msg)
+            if report_fn:
+                report_fn(msg)
             return
         print(f"[調査] 処理対象: 選択されたメッシュ {len(candidates)} 個")
     else:
@@ -378,7 +394,10 @@ def process_scene():
             candidates = [o for o in scene.objects if o.type == "MESH"]
         print(f"[調査] 処理対象: メッシュ {len(candidates)} 個")
     if not candidates:
-        print("メッシュオブジェクトがありません。")
+        msg = "メッシュオブジェクトがありません。"
+        print(msg)
+        if report_fn:
+            report_fn(msg)
         return
     for i, o in enumerate(candidates):
         print(f"  - [{i}] {o.name}")
@@ -393,6 +412,8 @@ def process_scene():
             print(f"  ベイク中: {obj.name} → 属性 \"{BAKE_TARGET_ATTR_NAME}\"")
             if bake_material_to_vertex_colors(obj, BAKE_TARGET_ATTR_NAME):
                 print(f"    完了: {obj.name}")
+                if report_fn:
+                    report_fn(f"ベイク完了: {obj.name}")
             else:
                 print(f"    スキップまたは失敗: {obj.name}")
 
@@ -419,9 +440,14 @@ def process_scene():
             else:
                 print(f"  頂点色適用スキップ: {obj.name}")
         if not created:
-            print("頂点色を適用できるメッシュがありません。")
+            msg = "頂点色を適用できるメッシュがありません。"
+            print(msg)
+            if report_fn:
+                report_fn(msg)
             return
         print(f"[調査] 頂点色を適用したオブジェクト: {len(created)} 個（メッシュは分割していません）")
+        if report_fn:
+            report_fn(f"減色・頂点色適用完了: {len(created)} オブジェクト")
     else:
         # 従来: 色ごとにメッシュ分割
         print("[調査] モード: split（色ごとにメッシュ分割）")
@@ -440,9 +466,14 @@ def process_scene():
             new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
             created.extend(new_objs)
         if not created:
-            print("分割できるメッシュがありません。")
+            msg = "分割できるメッシュがありません。"
+            print(msg)
+            if report_fn:
+                report_fn(msg)
             return
         print(f"[調査] 作成した分割オブジェクト: {len(created)} 個（色ごと）")
+        if report_fn:
+            report_fn(f"減色・分割完了: {len(created)} オブジェクト")
     if EXPORT_MODE != "vertex_color_only":
         for i, o in enumerate(created):
             mat_info = ""
@@ -521,43 +552,58 @@ def process_scene():
                 o.scale *= EXPORT_SCALE
             bpy.ops.object.transform_apply(scale=True)
 
-        # エクスポート形式に応じて 3MF または 頂点色付き OBJ を出力
-        if EXPORT_FORMAT == "obj":
+        # エクスポート形式に応じて 3MF または 頂点色付き OBJ を出力（形式は effective_path の拡張子で判定済み）
+        if export_format_from_path == "obj":
             # 頂点色付き OBJ（Bambu Studio 等で色が認識される場合あり）
-            obj_path = OUTPUT_PATH.rstrip()
+            obj_path = effective_path
             if not obj_path.lower().endswith(".obj"):
                 base = obj_path.rsplit(".", 1)[0] if "." in obj_path else obj_path
                 obj_path = base + ".obj"
             try:
                 bpy.ops.wm.obj_export(filepath=obj_path, export_colors=True)
                 print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+                if report_fn:
+                    report_fn(f"エクスポート完了: {obj_path}")
             except TypeError:
-                # パラメータ名が export_vertex_colors 等の場合
                 try:
                     bpy.ops.wm.obj_export(filepath=obj_path, export_vertex_colors=True)
                     print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+                    if report_fn:
+                        report_fn(f"エクスポート完了: {obj_path}")
                 except TypeError:
                     bpy.ops.wm.obj_export(filepath=obj_path)
                     print(f"OBJをエクスポートしました（頂点色オプションは未対応の可能性）: {obj_path}")
+                    if report_fn:
+                        report_fn(f"エクスポート完了: {obj_path}")
             except AttributeError:
-                # レガシー export_scene.obj にフォールバック
                 try:
                     bpy.ops.export_scene.obj(filepath=obj_path, use_selection=True, use_materials=False, export_colors=True)
                     print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+                    if report_fn:
+                        report_fn(f"エクスポート完了: {obj_path}")
                 except Exception as e:
                     print(f"OBJエクスポート失敗: {e}")
+                    if report_fn:
+                        report_fn(f"OBJエクスポート失敗: {e}")
         else:
             # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
             try:
-                bpy.ops.export_mesh.threemf(filepath=OUTPUT_PATH)
-                print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
+                bpy.ops.export_mesh.threemf(filepath=effective_path)
+                print(f"減色された3MFファイルをエクスポートしました: {effective_path}")
+                if report_fn:
+                    report_fn(f"エクスポート完了: {effective_path}")
             except AttributeError:
                 try:
-                    bpy.ops.export_mesh.three_mf(filepath=OUTPUT_PATH)
-                    print(f"減色された3MFファイルをエクスポートしました: {OUTPUT_PATH}")
+                    bpy.ops.export_mesh.three_mf(filepath=effective_path)
+                    print(f"減色された3MFファイルをエクスポートしました: {effective_path}")
+                    if report_fn:
+                        report_fn(f"エクスポート完了: {effective_path}")
                 except AttributeError:
-                    print("3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。")
-                    print("エクスポートパス:", OUTPUT_PATH)
+                    msg = "3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。"
+                    print(msg)
+                    print("エクスポートパス:", effective_path)
+                    if report_fn:
+                        report_fn(msg)
 
         # エクスポート用コピーを削除（名前で再取得して参照無効化を回避）
         for name in export_object_names:
@@ -600,5 +646,29 @@ def process_scene():
         print("[調査] 元オブジェクトをコレクションに戻しました。")
 
 
+class EXPORT_OT_4color(bpy.types.Operator, ExportHelper):
+    """4色減色して 3MF または頂点色付き OBJ でエクスポート（保存先をダイアログで指定）"""
+    bl_idname = "export_4color.export"
+    bl_label = "4色減色 3MF/OBJ をエクスポート"
+    bl_options = {"REGISTER"}
+
+    filename_ext = ""
+    filter_glob: bpy.props.StringProperty(default="*.obj;*.3mf", options={"HIDDEN"})
+
+    def execute(self, context):
+        report_fn = lambda msg: self.report({"INFO"}, msg)
+        process_scene(output_path=self.filepath, report_fn=report_fn)
+        return {"FINISHED"}
+
+
+def register():
+    bpy.utils.register_class(EXPORT_OT_4color)
+
+
+def unregister():
+    bpy.utils.unregister_class(EXPORT_OT_4color)
+
+
 if __name__ == "__main__":
-    process_scene()
+    register()
+    bpy.ops.export_4color.export("INVOKE_DEFAULT")
