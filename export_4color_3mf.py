@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-# Blender 5.0.1 向け: 4色減色 → オブジェクト分割 → 3MFエクスポート（Bambu Studio 2.5.0.66 等）
+# Blender 5.0.1 向け: 4色減色 → 頂点色付き OBJ エクスポート（Bambu Studio 2.5.0.66 等）
 
 import bpy
 import bmesh
 from bpy_extras.io_utils import ExportHelper
 
 # ---------- 設定 ----------
-OUTPUT_PATH = "D:/3DCG/output_4colors_quantized_only.3mf"
-# エクスポート形式: "3mf" = 3MF（Bambu等）, "obj" = 頂点色付きOBJ（Bambu等で色が取れる場合あり）
-EXPORT_FORMAT = "obj"  # "3mf" または "obj"
-NUM_COLORS = 4
+OUTPUT_PATH = "D:/3DCG/output_4colors_quantized_only.obj"
+NUM_COLORS = 0  # 0 = 減色なし（元の色をそのまま出力）, 2以上 = 指定色数に減色
 KMEANS_ITERATIONS = 20
 EXPORT_SCALE = 0.1  # 出力サイズを10%に
 USE_SELECTION_ONLY = True  # True: 選択されたメッシュのみ処理（1体だけ出力したい場合は1つだけ選択）
 BAKE_TO_VERTEX_COLOR = True  # True: 表示色を頂点カラーにベイクしてから減色（テクスチャ等も反映）
+PRIORITIZE_BAKE_OVER_VERTEX_COLOR = True  # True: 頂点カラーがあっても焼き込みを優先（デフォルトオン）
 BAKE_TARGET_ATTR_NAME = "Col"  # ベイク先のカラー属性名（"Col" で既存を上書き / "Color" で新規）
 
 # エクスポートモード: "split" = 色ごとにメッシュ分割（従来）, "vertex_color_only" = 分割せず頂点色のみ（非多様体回避）
@@ -21,6 +20,19 @@ EXPORT_MODE = "vertex_color_only"  # 非多様体エッジを避けたい場合�
 
 # 進捗ログ: この件数ごとにコンソールに出力（0 で無効）
 PROGRESS_LOG_INTERVAL = 5000
+
+# テクスチャサンプリング時の補正
+TEXTURE_SAMPLE_ROTATION = 0  # 回転（度）: 0, 90, 180, 270
+TEXTURE_SAMPLE_FLIP_H = False  # 左右反転
+TEXTURE_SAMPLE_FLIP_V = False  # 上下反転
+
+
+def has_vertex_colors(obj):
+    """メッシュに頂点カラー（カラー属性）が存在するか判定する。"""
+    if obj.type != "MESH" or not obj.data:
+        return False
+    mesh = obj.data
+    return len(mesh.color_attributes) > 0
 
 
 def ensure_bake_target_color_attribute(mesh, name):
@@ -48,14 +60,28 @@ def bake_material_to_vertex_colors(obj, target_attr_name="Col"):
     scene.render.engine = "CYCLES"
     if hasattr(scene, "cycles"):
         scene.cycles.bake_type = "DIFFUSE"
-        if hasattr(scene.cycles, "bake_direct"):
-            scene.cycles.bake_direct = False
-        if hasattr(scene.cycles, "bake_indirect"):
-            scene.cycles.bake_indirect = False
     # BakeSettings (Blender 4.x/5.x): 頂点カラーへベイク
+    # テクスチャ色を取得するため、照明を無効化し表面色（COLOR/DIFFUSE）のみベイク
     bake = getattr(scene.render, "bake", None)
-    if bake is not None and hasattr(bake, "target"):
-        bake.target = "VERTEX_COLORS"
+    if bake is not None:
+        if hasattr(bake, "target"):
+            bake.target = "VERTEX_COLORS"
+        # 照明を無効化 → マテリアル/テクスチャの色のみベイク（単色化を防ぐ）
+        if hasattr(bake, "use_pass_direct"):
+            bake.use_pass_direct = False
+        if hasattr(bake, "use_pass_indirect"):
+            bake.use_pass_indirect = False
+        if hasattr(bake, "use_pass_emit"):
+            bake.use_pass_emit = False
+        if hasattr(bake, "use_pass_glossy"):
+            bake.use_pass_glossy = False
+        if hasattr(bake, "use_pass_transmission"):
+            bake.use_pass_transmission = False
+        # COLOR と DIFFUSE は有効のまま（表面色・アルベドを取得）
+        if hasattr(bake, "use_pass_color"):
+            bake.use_pass_color = True
+        if hasattr(bake, "use_pass_diffuse"):
+            bake.use_pass_diffuse = True
     # 選択をこのオブジェクトだけに
     bpy.ops.object.select_all(action="DESELECT")
     obj.select_set(True)
@@ -158,7 +184,7 @@ def get_face_colors_from_mesh(obj):
             mat_index = face.material_index
             if mat_index is not None and mat_index < len(obj.material_slots):
                 mat = obj.material_slots[mat_index].material
-                if mat and mat.use_nodes:
+                if mat and getattr(mat, "node_tree", None) is not None:
                     base_color = (0.5, 0.5, 0.5)
                     for n in mat.node_tree.nodes:
                         if n.type == "BSDF_PRINCIPLED":
@@ -172,6 +198,115 @@ def get_face_colors_from_mesh(obj):
 
     bm.free()
     return has_vertex_color, face_colors
+
+
+def get_face_colors_from_texture(obj, texture_sample_rotation=None, texture_sample_flip_h=None, texture_sample_flip_v=None):
+    """
+    マテリアルから Image Texture を取得し、各面の UV でテクスチャをサンプリングして面の色を返す。
+    マテリアルの UV Map ノードで指定された UV レイヤーを使用（ずれ防止）。
+    """
+    mesh = obj.data
+    if not mesh.polygons:
+        return None
+    # マテリアルから Image Texture と UV マップ名を取得
+    img = None
+    uv_map_name = None
+    for slot in obj.material_slots:
+        mat = slot.material
+        if not mat or getattr(mat, "node_tree", None) is None:
+            continue
+        for node in mat.node_tree.nodes:
+            if node.type == "TEX_IMAGE" and node.image:
+                img = node.image
+                # Image Texture の Vector 入力に接続された UV Map ノードを探す
+                if node.inputs and node.inputs["Vector"].links:
+                    from_node = node.inputs["Vector"].links[0].from_node
+                    if from_node.type == "UVMAP" and hasattr(from_node, "uv_map"):
+                        uv_map_name = from_node.uv_map
+                break
+        if img:
+            break
+    if not img or not img.pixels:
+        return None
+    # マテリアルが使用する UV レイヤーを選択（指定がなければ active または最初のレイヤー）
+    if uv_map_name and uv_map_name in mesh.uv_layers:
+        uv_layer = mesh.uv_layers[uv_map_name]
+        print(f"  テクスチャ用 UV レイヤー: \"{uv_map_name}\" (マテリアルと一致)")
+    else:
+        uv_layer = mesh.uv_layers.active if mesh.uv_layers.active else (mesh.uv_layers[0] if mesh.uv_layers else None)
+        if uv_map_name and uv_map_name not in mesh.uv_layers:
+            print(f"  注意: UV マップ \"{uv_map_name}\" が見つからないため、アクティブレイヤーを使用")
+    if not uv_layer:
+        return None
+    pixels = img.pixels[:]
+    width, height = img.size
+    if width <= 0 or height <= 0:
+        return None
+    rot_val = texture_sample_rotation if texture_sample_rotation is not None else TEXTURE_SAMPLE_ROTATION
+    rot = (int(rot_val) % 360) // 90 * 90  # 0, 90, 180, 270 に正規化
+    flip_h = texture_sample_flip_h if texture_sample_flip_h is not None else TEXTURE_SAMPLE_FLIP_H
+    flip_v = texture_sample_flip_v if texture_sample_flip_v is not None else TEXTURE_SAMPLE_FLIP_V
+    if rot or flip_h or flip_v:
+        parts = []
+        if rot:
+            parts.append(f"回転{rot}°")
+        if flip_h:
+            parts.append("左右反転")
+        if flip_v:
+            parts.append("上下反転")
+        print(f"  テクスチャサンプリング補正: {', '.join(parts)}")
+    face_colors = []
+    n_faces = len(mesh.polygons)
+    log_interval = PROGRESS_LOG_INTERVAL if PROGRESS_LOG_INTERVAL > 0 else n_faces + 1
+    for fi, poly in enumerate(mesh.polygons):
+        if (fi + 1) % log_interval == 0 or fi == 0 or fi == n_faces - 1:
+            print(f"    テクスチャサンプリング: {fi + 1}/{n_faces}")
+        r, g, b = 0.0, 0.0, 0.0
+        n = 0
+        for loop_idx in poly.loop_indices:
+            uv = uv_layer.data[loop_idx].uv
+            u = max(0.0, min(1.0, uv[0]))
+            v = max(0.0, min(1.0, uv[1]))
+            if flip_h:
+                u = 1.0 - u
+            if flip_v:
+                v = 1.0 - v
+            # 回転補正: UV→画像ピクセル座標の変換
+            if rot == 90:
+                px = min(width - 1, int(v * width))
+                py = min(height - 1, int((1.0 - u) * height))
+            elif rot == 180:
+                px = min(width - 1, int((1.0 - u) * width))
+                py = min(height - 1, int(v * height))
+            elif rot == 270:
+                px = min(width - 1, int((1.0 - v) * width))
+                py = min(height - 1, int(u * height))
+            else:
+                px = min(width - 1, int(u * width))
+                py = min(height - 1, int((1.0 - v) * height))
+            idx = (py * width + px) * 4
+            r += pixels[idx]
+            g += pixels[idx + 1]
+            b += pixels[idx + 2]
+            n += 1
+        if n > 0:
+            face_colors.append((r / n, g / n, b / n))
+        else:
+            face_colors.append((0.5, 0.5, 0.5))
+    return face_colors
+
+
+def _has_color_variance(face_colors, threshold=0.02):
+    """面の色に十分なばらつきがあるか判定。"""
+    if not face_colors or len(face_colors) < 2:
+        return False
+    min_r = min(c[0] for c in face_colors)
+    max_r = max(c[0] for c in face_colors)
+    min_g = min(c[1] for c in face_colors)
+    max_g = max(c[1] for c in face_colors)
+    min_b = min(c[2] for c in face_colors)
+    max_b = max(c[2] for c in face_colors)
+    return (max_r - min_r) > threshold or (max_g - min_g) > threshold or (max_b - min_b) > threshold
 
 
 def quantize_colors_kmeans(face_colors, k=4, max_iter=20):
@@ -222,6 +357,18 @@ def quantize_colors_kmeans(face_colors, k=4, max_iter=20):
                 centroids[j] = tuple(new_centroids[j][t] / counts[j] for t in range(3))
 
     return [tuple(c) for c in centroids], assignments
+
+
+def snap_palette_to_discrete(palette, bits=8):
+    """
+    パレットを離散値に丸め、OBJ出力時に同じ色が微妙な差で複数と認識されるのを防ぐ。
+    bits=8 → 各成分 0..255 に丸めて 1/255 刻みの float で返す。
+    """
+    scale = (1 << bits) - 1  # 255
+    return [
+        tuple(round(x * scale) / scale for x in c[:3])
+        for c in palette
+    ]
 
 
 def ensure_distinct_palette(palette, k=4):
@@ -292,14 +439,13 @@ def mesh_split_by_color(obj, face_colors, assignments, palette):
         new_obj.matrix_world = obj.matrix_world.copy()
         bpy.context.collection.objects.link(new_obj)
 
-        # マテリアルを1色で設定（3MF/Bambuで色として認識されやすくする）
+        # マテリアルを1色で設定（OBJ/Bambuで色として認識されやすくする）
         color = palette[color_idx]
         mat_name = f"Color_{color_idx}_{obj.name}"
         mat = bpy.data.materials.get(mat_name)
         if mat is None:
             mat = bpy.data.materials.new(name=mat_name)
-            mat.use_nodes = True
-            nodes = mat.node_tree.nodes
+            nodes = mat.node_tree.nodes if mat.node_tree else []
             principled = None
             for n in nodes:
                 if n.type == "BSDF_PRINCIPLED":
@@ -360,22 +506,32 @@ def apply_quantized_vertex_colors(obj, face_colors, assignments, palette, attr_n
     return True
 
 
-def process_scene(output_path=None, report_fn=None):
-    """選択メッシュを4色減色・分割し、3MF/OBJエクスポートする。output_path が None のときは OUTPUT_PATH を使用。"""
+def process_scene(output_path=None, report_fn=None, num_colors=None, prioritize_bake_over_vertex_color=None,
+                 texture_sample_rotation=None, texture_sample_flip_h=None, texture_sample_flip_v=None):
+    """選択メッシュをN色減色し、頂点色付き OBJ でエクスポートする。output_path が None のときは OUTPUT_PATH、num_colors が None のときは NUM_COLORS を使用。"""
     scene = bpy.context.scene
     view_layer = bpy.context.view_layer
 
-    # 保存パス: 渡されていればそれを使用、なければ設定の OUTPUT_PATH
+    # 色数・保存パス・フラグ: 渡されていればそれを使用
+    # n_colors=0 は減色なし（元の色をそのまま出力）
+    n_colors = num_colors if num_colors is not None else NUM_COLORS
+    skip_reduction = (n_colors == 0)
+    tex_rot = texture_sample_rotation if texture_sample_rotation is not None else TEXTURE_SAMPLE_ROTATION
+    tex_flip_h = texture_sample_flip_h if texture_sample_flip_h is not None else TEXTURE_SAMPLE_FLIP_H
+    tex_flip_v = texture_sample_flip_v if texture_sample_flip_v is not None else TEXTURE_SAMPLE_FLIP_V
+    prioritize_bake = prioritize_bake_over_vertex_color if prioritize_bake_over_vertex_color is not None else PRIORITIZE_BAKE_OVER_VERTEX_COLOR
     effective_path = (output_path or OUTPUT_PATH).rstrip()
-    # 拡張子からエクスポート形式を判定（.obj → OBJ、それ以外 → 3MF）
-    export_format_from_path = "obj" if effective_path.lower().endswith(".obj") else "3mf"
+    # OBJ のみ対応。拡張子が .obj でなければ .obj に補正する
+    if not effective_path.lower().endswith(".obj"):
+        base = effective_path.rsplit(".", 1)[0] if "." in effective_path else effective_path
+        effective_path = base + ".obj"
 
     def report(msg):
         if report_fn:
             report_fn(msg)
         print(msg)
 
-    report("4色減色・エクスポートを開始します")
+    report("減色なし・エクスポートを開始します" if skip_reduction else f"{n_colors}色減色・エクスポートを開始します")
 
     # 対象: USE_SELECTION_ONLY のときは選択メッシュのみ、そうでなければ全メッシュ
     if USE_SELECTION_ONLY:
@@ -403,25 +559,33 @@ def process_scene(output_path=None, report_fn=None):
         print(f"  - [{i}] {o.name}")
 
     # 表示色を頂点カラーにベイク（オプション）
-    if BAKE_TO_VERTEX_COLOR and candidates:
-        scene.render.engine = "CYCLES"
-        for obj in candidates:
-            bpy.ops.object.select_all(action="DESELECT")
-            obj.select_set(True)
-            view_layer.objects.active = obj
+    # ベイク条件: BAKE_TO_VERTEX_COLOR が True、または頂点カラーがあっても焼き込みを優先する場合
+    for obj in candidates:
+        has_vcol = has_vertex_colors(obj)
+        should_bake = BAKE_TO_VERTEX_COLOR or (prioritize_bake and has_vcol)
+        if not should_bake:
+            if has_vcol:
+                print(f"  頂点カラーを使用（焼き込みスキップ）: {obj.name}")
+            continue
+        bpy.ops.object.select_all(action="DESELECT")
+        obj.select_set(True)
+        view_layer.objects.active = obj
+        if has_vcol and not BAKE_TO_VERTEX_COLOR:
+            print(f"  頂点カラーあり→焼き込みを優先: {obj.name} → 属性 \"{BAKE_TARGET_ATTR_NAME}\"")
+        else:
             print(f"  ベイク中: {obj.name} → 属性 \"{BAKE_TARGET_ATTR_NAME}\"")
-            if bake_material_to_vertex_colors(obj, BAKE_TARGET_ATTR_NAME):
-                print(f"    完了: {obj.name}")
-                if report_fn:
-                    report_fn(f"ベイク完了: {obj.name}")
-            else:
-                print(f"    スキップまたは失敗: {obj.name}")
+        if bake_material_to_vertex_colors(obj, BAKE_TARGET_ATTR_NAME):
+            print(f"    完了: {obj.name}")
+            if report_fn:
+                report_fn(f"ベイク完了: {obj.name}")
+        else:
+            print(f"    スキップまたは失敗: {obj.name}")
 
     # EXPORT_MODE に応じて「分割」するか「頂点色のみ書き戻し」か
     created = []
     if EXPORT_MODE == "vertex_color_only":
         # 分割せず、減色した色を頂点カラーに書き戻すだけ（1メッシュのまま → 非多様体回避）
-        print("[調査] モード: vertex_color_only（分割せず頂点色のみ）")
+        print("[調査] モード: vertex_color_only（分割せず頂点色のみ）" + (" [減色なし]" if skip_reduction else ""))
         for obj in candidates:
             bpy.ops.object.select_all(action="DESELECT")
             obj.select_set(True)
@@ -429,11 +593,29 @@ def process_scene(output_path=None, report_fn=None):
             has_vcol, face_colors = get_face_colors_from_mesh(obj)
             if not face_colors:
                 continue
-            palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
-            if len(set(assignments)) < 2:
-                assignments = [i % NUM_COLORS for i in range(len(assignments))]
-                print("  頂点色が一色のため、面を均等に4色に割り当てました。")
-            palette = ensure_distinct_palette(palette, k=NUM_COLORS)
+            if skip_reduction:
+                # 減色なし: 元の色をそのまま使用（ベイクが単色ならテクスチャサンプリングを試行）
+                if not _has_color_variance(face_colors):
+                    tex_colors = get_face_colors_from_texture(obj, tex_rot, tex_flip_h, tex_flip_v)
+                    if tex_colors and _has_color_variance(tex_colors):
+                        print(f"  ベイクが単色だったため、テクスチャを直接サンプリング: {obj.name}")
+                        face_colors = tex_colors
+                palette = face_colors
+                assignments = list(range(len(face_colors)))
+            else:
+                palette, assignments = quantize_colors_kmeans(face_colors, k=n_colors, max_iter=KMEANS_ITERATIONS)
+                if len(set(assignments)) < 2:
+                    # ベイクが単色→テクスチャを直接サンプリングして再試行
+                    tex_colors = get_face_colors_from_texture(obj, tex_rot, tex_flip_h, tex_flip_v)
+                    if tex_colors and _has_color_variance(tex_colors):
+                        print(f"  ベイクが単色だったため、テクスチャを直接サンプリングして再試行: {obj.name}")
+                        face_colors = tex_colors
+                        palette, assignments = quantize_colors_kmeans(face_colors, k=n_colors, max_iter=KMEANS_ITERATIONS)
+                    if len(set(assignments)) < 2:
+                        assignments = [i % n_colors for i in range(len(assignments))]
+                        print(f"  頂点色が一色のため、面を均等に{n_colors}色に割り当てました。（テクスチャも単色の可能性）")
+                palette = ensure_distinct_palette(palette, k=n_colors)
+                palette = snap_palette_to_discrete(palette)
             if apply_quantized_vertex_colors(obj, face_colors, assignments, palette):
                 created.append(obj)
                 print(f"  頂点色を適用: {obj.name}")
@@ -449,31 +631,58 @@ def process_scene(output_path=None, report_fn=None):
         if report_fn:
             report_fn(f"減色・頂点色適用完了: {len(created)} オブジェクト")
     else:
-        # 従来: 色ごとにメッシュ分割
-        print("[調査] モード: split（色ごとにメッシュ分割）")
-        for obj in candidates:
-            bpy.ops.object.select_all(action="DESELECT")
-            obj.select_set(True)
-            view_layer.objects.active = obj
-            has_vcol, face_colors = get_face_colors_from_mesh(obj)
-            if not face_colors:
-                continue
-            palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
-            if len(set(assignments)) < 2:
-                assignments = [i % NUM_COLORS for i in range(len(assignments))]
-                print("  頂点色が一色のため、面を均等に4分割しました。")
-            palette = ensure_distinct_palette(palette, k=NUM_COLORS)
-            new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
-            created.extend(new_objs)
+        # 従来: 色ごとにメッシュ分割（減色なしの場合は頂点色のみで出力）
+        if skip_reduction:
+            print("[調査] 減色なしのため split は不可→頂点色のみで出力します")
+            for obj in candidates:
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                view_layer.objects.active = obj
+                has_vcol, face_colors = get_face_colors_from_mesh(obj)
+                if not face_colors:
+                    continue
+                if not _has_color_variance(face_colors):
+                    tex_colors = get_face_colors_from_texture(obj, tex_rot, tex_flip_h, tex_flip_v)
+                    if tex_colors and _has_color_variance(tex_colors):
+                        print(f"  ベイクが単色だったため、テクスチャを直接サンプリング: {obj.name}")
+                        face_colors = tex_colors
+                palette = face_colors
+                assignments = list(range(len(face_colors)))
+                if apply_quantized_vertex_colors(obj, face_colors, assignments, palette):
+                    created.append(obj)
+                    print(f"  頂点色を適用: {obj.name}")
+        else:
+            print("[調査] モード: split（色ごとにメッシュ分割）")
+            for obj in candidates:
+                bpy.ops.object.select_all(action="DESELECT")
+                obj.select_set(True)
+                view_layer.objects.active = obj
+                has_vcol, face_colors = get_face_colors_from_mesh(obj)
+                if not face_colors:
+                    continue
+                palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
+                if len(set(assignments)) < 2:
+                    tex_colors = get_face_colors_from_texture(obj, tex_rot, tex_flip_h, tex_flip_v)
+                    if tex_colors and _has_color_variance(tex_colors):
+                        print(f"  ベイクが単色だったため、テクスチャを直接サンプリングして再試行: {obj.name}")
+                        face_colors = tex_colors
+                        palette, assignments = quantize_colors_kmeans(face_colors, k=NUM_COLORS, max_iter=KMEANS_ITERATIONS)
+                    if len(set(assignments)) < 2:
+                        assignments = [i % NUM_COLORS for i in range(len(assignments))]
+                        print("  頂点色が一色のため、面を均等に4分割しました。（テクスチャも単色の可能性）")
+                palette = ensure_distinct_palette(palette, k=NUM_COLORS)
+                palette = snap_palette_to_discrete(palette)
+                new_objs = mesh_split_by_color(obj, face_colors, assignments, palette)
+                created.extend(new_objs)
         if not created:
-            msg = "分割できるメッシュがありません。"
+            msg = "分割できるメッシュがありません。" if not skip_reduction else "頂点色を適用できるメッシュがありません。"
             print(msg)
             if report_fn:
                 report_fn(msg)
             return
-        print(f"[調査] 作成した分割オブジェクト: {len(created)} 個（色ごと）")
+        print(f"[調査] 作成した分割オブジェクト: {len(created)} 個（色ごと）" if not skip_reduction else f"[調査] 頂点色を適用したオブジェクト: {len(created)} 個（減色なし）")
         if report_fn:
-            report_fn(f"減色・分割完了: {len(created)} オブジェクト")
+            report_fn(f"減色・分割完了: {len(created)} オブジェクト" if not skip_reduction else f"頂点色適用完了: {len(created)} オブジェクト（減色なし）")
     if EXPORT_MODE != "vertex_color_only":
         for i, o in enumerate(created):
             mat_info = ""
@@ -487,7 +696,7 @@ def process_scene(output_path=None, report_fn=None):
                             break
             print(f"  - [{i}] {o.name}{mat_info}")
 
-    # 分割モード時のみ「元の候補オブジェクト」をシーンから外す（3MF に含めない）
+    # 分割モード時のみ「元の候補オブジェクト」をシーンから外す（エクスポート対象に含めない）
     restored_collections = []  # [(obj_name, [col_name, ...]), ...] 名前で保存して参照無効化を回避
     if EXPORT_MODE == "split":
         for obj in candidates:
@@ -552,58 +761,34 @@ def process_scene(output_path=None, report_fn=None):
                 o.scale *= EXPORT_SCALE
             bpy.ops.object.transform_apply(scale=True)
 
-        # エクスポート形式に応じて 3MF または 頂点色付き OBJ を出力（形式は effective_path の拡張子で判定済み）
-        if export_format_from_path == "obj":
-            # 頂点色付き OBJ（Bambu Studio 等で色が認識される場合あり）
-            obj_path = effective_path
-            if not obj_path.lower().endswith(".obj"):
-                base = obj_path.rsplit(".", 1)[0] if "." in obj_path else obj_path
-                obj_path = base + ".obj"
+        # 頂点色付き OBJ を出力
+        obj_path = effective_path
+        try:
+            bpy.ops.wm.obj_export(filepath=obj_path, export_colors=True)
+            print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+            if report_fn:
+                report_fn(f"エクスポート完了: {obj_path}")
+        except TypeError:
             try:
-                bpy.ops.wm.obj_export(filepath=obj_path, export_colors=True)
+                bpy.ops.wm.obj_export(filepath=obj_path, export_vertex_colors=True)
                 print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
                 if report_fn:
                     report_fn(f"エクスポート完了: {obj_path}")
             except TypeError:
-                try:
-                    bpy.ops.wm.obj_export(filepath=obj_path, export_vertex_colors=True)
-                    print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
-                    if report_fn:
-                        report_fn(f"エクスポート完了: {obj_path}")
-                except TypeError:
-                    bpy.ops.wm.obj_export(filepath=obj_path)
-                    print(f"OBJをエクスポートしました（頂点色オプションは未対応の可能性）: {obj_path}")
-                    if report_fn:
-                        report_fn(f"エクスポート完了: {obj_path}")
-            except AttributeError:
-                try:
-                    bpy.ops.export_scene.obj(filepath=obj_path, use_selection=True, use_materials=False, export_colors=True)
-                    print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
-                    if report_fn:
-                        report_fn(f"エクスポート完了: {obj_path}")
-                except Exception as e:
-                    print(f"OBJエクスポート失敗: {e}")
-                    if report_fn:
-                        report_fn(f"OBJエクスポート失敗: {e}")
-        else:
-            # 3MF エクスポート（アドオンで export_mesh.threemf が登録されている前提）
-            try:
-                bpy.ops.export_mesh.threemf(filepath=effective_path)
-                print(f"減色された3MFファイルをエクスポートしました: {effective_path}")
+                bpy.ops.wm.obj_export(filepath=obj_path)
+                print(f"OBJをエクスポートしました（頂点色オプションは未対応の可能性）: {obj_path}")
                 if report_fn:
-                    report_fn(f"エクスポート完了: {effective_path}")
-            except AttributeError:
-                try:
-                    bpy.ops.export_mesh.three_mf(filepath=effective_path)
-                    print(f"減色された3MFファイルをエクスポートしました: {effective_path}")
-                    if report_fn:
-                        report_fn(f"エクスポート完了: {effective_path}")
-                except AttributeError:
-                    msg = "3MFエクスポートが見つかりません。Blenderに「3MF format」アドオンを有効にしてください。"
-                    print(msg)
-                    print("エクスポートパス:", effective_path)
-                    if report_fn:
-                        report_fn(msg)
+                    report_fn(f"エクスポート完了: {obj_path}")
+        except AttributeError:
+            try:
+                bpy.ops.export_scene.obj(filepath=obj_path, use_selection=True, use_materials=False, export_colors=True)
+                print(f"減色された頂点色付きOBJをエクスポートしました: {obj_path}")
+                if report_fn:
+                    report_fn(f"エクスポート完了: {obj_path}")
+            except Exception as e:
+                print(f"OBJエクスポート失敗: {e}")
+                if report_fn:
+                    report_fn(f"OBJエクスポート失敗: {e}")
 
         # エクスポート用コピーを削除（名前で再取得して参照無効化を回避）
         for name in export_object_names:
@@ -647,17 +832,68 @@ def process_scene(output_path=None, report_fn=None):
 
 
 class EXPORT_OT_4color(bpy.types.Operator, ExportHelper):
-    """4色減色して 3MF または頂点色付き OBJ でエクスポート（保存先をダイアログで指定）"""
+    """頂点色付き OBJ でエクスポート（0=減色なし、2以上=指定色数に減色）"""
     bl_idname = "export_4color.export"
-    bl_label = "4色減色 3MF/OBJ をエクスポート"
+    bl_label = "頂点色 OBJ をエクスポート"
     bl_options = {"REGISTER"}
 
-    filename_ext = ""
-    filter_glob: bpy.props.StringProperty(default="*.obj;*.3mf", options={"HIDDEN"})
+    filename_ext = ".obj"
+    filter_glob: bpy.props.StringProperty(default="*.obj", options={"HIDDEN"})
+    num_colors: bpy.props.IntProperty(
+        name="色数",
+        description="0=減色なし（元の色をそのまま）, 2以上=指定色数に減色（フィラメント本数に合わせて）",
+        default=0,
+        min=0,
+        max=32,
+        soft_min=0,
+        soft_max=16,
+    )
+    prioritize_bake_over_vertex_color: bpy.props.BoolProperty(
+        name="頂点カラーがあっても焼き込みを優先",
+        description="頂点カラーが存在する場合でも、マテリアル表示色を焼き込んでから減色する",
+        default=True,
+    )
+    texture_sample_rotation: bpy.props.IntProperty(
+        name="テクスチャ回転補正",
+        description="UV画像が回転している場合の補正（度）: 0=なし, 90, 180, 270",
+        default=0,
+        min=0,
+        max=270,
+        step=90,
+    )
+    texture_sample_flip_h: bpy.props.BoolProperty(
+        name="左右反転",
+        description="テクスチャサンプリングを左右反転",
+        default=False,
+    )
+    texture_sample_flip_v: bpy.props.BoolProperty(
+        name="上下反転",
+        description="テクスチャサンプリングを上下反転",
+        default=False,
+    )
+
+    def draw(self, context):
+        layout = self.layout
+        layout.prop(self, "num_colors")
+        layout.prop(self, "prioritize_bake_over_vertex_color")
+        box = layout.box()
+        box.label(text="テクスチャ補正（色ずれ時）:")
+        box.prop(self, "texture_sample_rotation")
+        row = box.row()
+        row.prop(self, "texture_sample_flip_h")
+        row.prop(self, "texture_sample_flip_v")
 
     def execute(self, context):
         report_fn = lambda msg: self.report({"INFO"}, msg)
-        process_scene(output_path=self.filepath, report_fn=report_fn)
+        process_scene(
+            output_path=self.filepath,
+            report_fn=report_fn,
+            num_colors=self.num_colors,
+            prioritize_bake_over_vertex_color=self.prioritize_bake_over_vertex_color,
+            texture_sample_rotation=self.texture_sample_rotation,
+            texture_sample_flip_h=self.texture_sample_flip_h,
+            texture_sample_flip_v=self.texture_sample_flip_v,
+        )
         return {"FINISHED"}
 
 

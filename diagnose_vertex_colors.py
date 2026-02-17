@@ -76,7 +76,7 @@ def diagnose():
         print(f"マテリアル数: {len(ob.material_slots)}")
         for i, slot in enumerate(ob.material_slots):
             mat = slot.material
-            if mat and mat.use_nodes:
+            if mat and getattr(mat, "node_tree", None) is not None:
                 base = (0.5, 0.5, 0.5)
                 for n in mat.node_tree.nodes:
                     if n.type == "BSDF_PRINCIPLED":
